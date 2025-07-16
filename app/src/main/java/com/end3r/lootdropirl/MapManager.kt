@@ -2,6 +2,8 @@ package com.end3r.lootdropirl
 
 import android.graphics.Color
 import android.util.Log
+import com.end3r.lootdropirl.model.LootBox
+import com.end3r.lootdropirl.model.LootType
 import com.google.android.gms.maps.CameraUpdateFactory
 import com.google.android.gms.maps.GoogleMap
 import com.google.android.gms.maps.model.*
@@ -14,125 +16,252 @@ class MapManager(
     private var userLocationMarker: Marker? = null
     private var pathPolyline: Polyline? = null
     private val pathPoints = mutableListOf<LatLng>()
+    private val lootBoxMarkers = mutableMapOf<String, Marker>()
 
     companion object {
         private const val TAG = "MapManager"
         private const val DEFAULT_ZOOM = 16f
         private const val PATH_COLOR = Color.BLUE
         private const val PATH_WIDTH = 8f
+        private const val LOOT_COLLECTION_RADIUS = 20f // meters
     }
 
     fun setupMap() {
         configureMap()
         observeLocationUpdates()
         observeLocationStatus()
+        observeLootBoxUpdates()
+        observeCollectedLootBoxes()
     }
 
     private fun configureMap() {
-        googleMap.apply {
-            mapType = GoogleMap.MAP_TYPE_NORMAL
+        try {
+            googleMap.apply {
+                mapType = GoogleMap.MAP_TYPE_NORMAL
+                uiSettings.isZoomControlsEnabled = true
+                uiSettings.isCompassEnabled = true
+                uiSettings.isMyLocationButtonEnabled = false
+                isMyLocationEnabled = false
 
-            // Enable UI controls
-            uiSettings.isZoomControlsEnabled = true
-            uiSettings.isCompassEnabled = true
-            uiSettings.isMyLocationButtonEnabled = false // We'll handle this manually
-            uiSettings.isMapToolbarEnabled = false
+                setOnMarkerClickListener { marker ->
+                    handleMarkerClick(marker)
+                }
 
-            // Set map style (optional - dark theme)
-            // setMapStyle(MapStyleOptions.loadRawResourceStyle(context, R.raw.map_style))
+                setOnMapClickListener { latLng ->
+                    handleMapClick(latLng)
+                }
 
-            Log.d(TAG, "Map configured successfully")
+                setOnCameraMoveStartedListener { reason ->
+                    Log.d(TAG, "Camera move started: $reason")
+                }
+            }
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Security exception in configureMap: ${e.message}")
         }
     }
 
     private fun observeLocationUpdates() {
-        viewModel.currentLocation.observeForever { location ->
+        viewModel.currentLocation.observe(viewModel.lifecycleOwner) { location ->
             location?.let {
-                updateUserLocation(it)
-                updatePath(it)
+                updateUserLocation(LatLng(it.latitude, it.longitude))
+                checkNearbyLootBoxes(LatLng(it.latitude, it.longitude))
             }
         }
     }
 
     private fun observeLocationStatus() {
-        viewModel.locationStatus.observeForever { isAvailable ->
-            if (isAvailable) {
-                Log.d(TAG, "Location services available")
+        viewModel.locationPermissionGranted.observe(viewModel.lifecycleOwner) { granted ->
+            if (granted) {
+                enableLocationFeatures()
             } else {
-                Log.w(TAG, "Location services not available")
+                disableLocationFeatures()
             }
         }
     }
 
-    private fun updateUserLocation(location: android.location.Location) {
-        val latLng = LatLng(location.latitude, location.longitude)
-
-        // Update or create user location marker
-        if (userLocationMarker == null) {
-            userLocationMarker = googleMap.addMarker(
-                MarkerOptions()
-                    .position(latLng)
-                    .title("You are here")
-                    .icon(BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_AZURE))
-            )
-
-            // Center camera on user location for first time
-            googleMap.animateCamera(
-                CameraUpdateFactory.newLatLngZoom(latLng, DEFAULT_ZOOM)
-            )
-        } else {
-            // Update existing marker position
-            userLocationMarker?.position = latLng
-
-            // Optionally keep camera following user (can be toggled)
-            if (viewModel.shouldFollowUser.value == true) {
-                googleMap.animateCamera(
-                    CameraUpdateFactory.newLatLng(latLng)
-                )
-            }
+    private fun observeLootBoxUpdates() {
+        viewModel.nearbyLootBoxes.observe(viewModel.lifecycleOwner) { lootBoxes ->
+            updateLootBoxMarkers(lootBoxes)
         }
-
-        Log.d(TAG, "User location updated: $latLng")
     }
 
-    private fun updatePath(location: android.location.Location) {
-        val latLng = LatLng(location.latitude, location.longitude)
+    private fun observeCollectedLootBoxes() {
+        viewModel.collectedLootBoxes.observe(viewModel.lifecycleOwner) { collectedIds ->
+            removeCollectedLootBoxMarkers(collectedIds)
+        }
+    }
 
-        // Add point to path
-        pathPoints.add(latLng)
+    private fun updateUserLocation(location: LatLng) {
+        userLocationMarker?.remove()
 
-        // Update polyline
-        pathPolyline?.remove()
-        pathPolyline = googleMap.addPolyline(
-            PolylineOptions()
-                .addAll(pathPoints)
-                .color(PATH_COLOR)
-                .width(PATH_WIDTH)
-                .geodesic(true)
+        userLocationMarker = googleMap.addMarker(
+            MarkerOptions()
+                .position(location)
+                .title("Your Location")
+                .icon(BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_BLUE))
         )
 
-        Log.d(TAG, "Path updated with ${pathPoints.size} points")
+        // Add to path
+        pathPoints.add(location)
+        updatePathPolyline()
+
+        // Move camera to user location if first time
+        if (pathPoints.size == 1) {
+            googleMap.animateCamera(
+                CameraUpdateFactory.newLatLngZoom(location, DEFAULT_ZOOM)
+            )
+        }
+    }
+
+    private fun updatePathPolyline() {
+        pathPolyline?.remove()
+
+        if (pathPoints.size >= 2) {
+            pathPolyline = googleMap.addPolyline(
+                PolylineOptions()
+                    .addAll(pathPoints)
+                    .color(PATH_COLOR)
+                    .width(PATH_WIDTH)
+                    .geodesic(true)
+            )
+        }
+    }
+
+    private fun updateLootBoxMarkers(lootBoxes: List<LootBox>) {
+        // Remove markers for loot boxes that are no longer nearby
+        val currentLootBoxIds = lootBoxes.map { it.id }.toSet()
+        lootBoxMarkers.keys.filter { !currentLootBoxIds.contains(it) }.forEach { id ->
+            lootBoxMarkers[id]?.remove()
+            lootBoxMarkers.remove(id)
+        }
+
+        // Add or update markers for current loot boxes
+        lootBoxes.forEach { lootBox ->
+            if (!lootBoxMarkers.containsKey(lootBox.id)) {
+                addLootBoxMarker(lootBox)
+            }
+        }
+    }
+
+    private fun addLootBoxMarker(lootBox: LootBox) {
+        val markerColor = when (lootBox.lootType) {
+            LootType.COMMON -> BitmapDescriptorFactory.HUE_GREEN
+            LootType.RARE -> BitmapDescriptorFactory.HUE_ORANGE
+            LootType.EPIC -> BitmapDescriptorFactory.HUE_VIOLET
+            LootType.LEGENDARY -> BitmapDescriptorFactory.HUE_YELLOW
+        }
+
+        val marker = googleMap.addMarker(
+            MarkerOptions()
+                .position(LatLng(lootBox.latitude, lootBox.longitude))
+                .title("${lootBox.lootType.name} Loot Box")
+                .snippet("Tap to collect!")
+                .icon(BitmapDescriptorFactory.defaultMarker(markerColor))
+        )
+
+        marker?.tag = lootBox.id
+        marker?.let { lootBoxMarkers[lootBox.id] = it }
+    }
+
+    private fun removeCollectedLootBoxMarkers(collectedIds: Set<String>) {
+        collectedIds.forEach { id ->
+            lootBoxMarkers[id]?.remove()
+            lootBoxMarkers.remove(id)
+        }
+    }
+
+    private fun checkNearbyLootBoxes(userLocation: LatLng) {
+        val currentLootBoxes = viewModel.nearbyLootBoxes.value ?: return
+
+        currentLootBoxes.forEach { lootBox ->
+            val lootBoxLocation = LatLng(lootBox.latitude, lootBox.longitude)
+            val distance = calculateDistance(userLocation, lootBoxLocation)
+
+            if (distance <= LOOT_COLLECTION_RADIUS) {
+                viewModel.collectLootBox(lootBox.id)
+            }
+        }
+    }
+
+    private fun calculateDistance(point1: LatLng, point2: LatLng): Float {
+        val results = FloatArray(1)
+        android.location.Location.distanceBetween(
+            point1.latitude, point1.longitude,
+            point2.latitude, point2.longitude,
+            results
+        )
+        return results[0]
+    }
+
+    private fun handleMarkerClick(marker: Marker): Boolean {
+        val lootBoxId = marker.tag as? String
+        return if (lootBoxId != null) {
+            viewModel.collectLootBox(lootBoxId)
+            true
+        } else {
+            false
+        }
+    }
+
+    private fun handleMapClick(latLng: LatLng) {
+        Log.d(TAG, "Map clicked at: ${latLng.latitude}, ${latLng.longitude}")
+        // Add any map click handling logic here
+    }
+
+    private fun enableLocationFeatures() {
+        try {
+            googleMap.isMyLocationEnabled = true
+            googleMap.uiSettings.isMyLocationButtonEnabled = true
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Security exception enabling location features: ${e.message}")
+        }
+    }
+
+    private fun disableLocationFeatures() {
+        try {
+            googleMap.isMyLocationEnabled = false
+            googleMap.uiSettings.isMyLocationButtonEnabled = false
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Security exception disabling location features: ${e.message}")
+        }
+    }
+
+    fun centerOnUserLocation() {
+        userLocationMarker?.position?.let { position ->
+            googleMap.animateCamera(
+                CameraUpdateFactory.newLatLngZoom(position, DEFAULT_ZOOM)
+            )
+        }
     }
 
     fun clearPath() {
-        pathPoints.clear()
         pathPolyline?.remove()
-        pathPolyline = null
-        Log.d(TAG, "Path cleared")
+        pathPoints.clear()
     }
 
-    fun toggleFollowUser() {
-        val currentSetting = viewModel.shouldFollowUser.value ?: false
-        viewModel.shouldFollowUser.value = !currentSetting
+    fun showAllLootBoxes() {
+        val allMarkers = mutableListOf<LatLng>()
 
-        if (!currentSetting) {
-            // If we're now following, center on user
-            viewModel.currentLocation.value?.let { location ->
-                val latLng = LatLng(location.latitude, location.longitude)
-                googleMap.animateCamera(
-                    CameraUpdateFactory.newLatLng(latLng)
-                )
-            }
+        userLocationMarker?.position?.let { allMarkers.add(it) }
+        lootBoxMarkers.values.forEach { marker ->
+            allMarkers.add(marker.position)
         }
+
+        if (allMarkers.isNotEmpty()) {
+            val bounds = LatLngBounds.Builder()
+            allMarkers.forEach { bounds.include(it) }
+
+            googleMap.animateCamera(
+                CameraUpdateFactory.newLatLngBounds(bounds.build(), 100)
+            )
+        }
+    }
+
+    fun cleanup() {
+        userLocationMarker?.remove()
+        pathPolyline?.remove()
+        lootBoxMarkers.values.forEach { it.remove() }
+        lootBoxMarkers.clear()
+        pathPoints.clear()
     }
 }
