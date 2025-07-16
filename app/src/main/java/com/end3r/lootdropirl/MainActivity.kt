@@ -101,11 +101,13 @@ class MainActivity : AppCompatActivity() {
 
     private fun initializeMap() {
         mapFragment.getMapAsync { googleMap ->
-            val mapManager = MapManager(googleMap, viewModel)
+            // Pass 'this' (MainActivity) as the LifecycleOwner
+            val mapManager = MapManager(googleMap, viewModel, this)
             mapManager.setupMap()
 
             // Start location tracking
-            val locationTracker = LocationTracker(this, viewModel)
+            // Pass 'this' (MainActivity) as the LifecycleOwner
+            val locationTracker = LocationTracker(this, viewModel, this)
             locationTracker.startLocationUpdates()
         }
     }

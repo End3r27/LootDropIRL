@@ -2,6 +2,7 @@ package com.end3r.lootdropirl
 
 import android.graphics.Color
 import android.util.Log
+import androidx.lifecycle.LifecycleOwner
 import com.end3r.lootdropirl.model.LootBox
 import com.end3r.lootdropirl.model.LootType
 import com.google.android.gms.maps.CameraUpdateFactory
@@ -10,13 +11,15 @@ import com.google.android.gms.maps.model.*
 
 class MapManager(
     private val googleMap: GoogleMap,
-    private val viewModel: MainViewModel
+    private val viewModel: MainViewModel,
+    private val lifecycleOwner: LifecycleOwner
 ) {
 
     private var userLocationMarker: Marker? = null
     private var pathPolyline: Polyline? = null
     private val pathPoints = mutableListOf<LatLng>()
     private val lootBoxMarkers = mutableMapOf<String, Marker>()
+    private var collectionRadiusCircle: Circle? = null
 
     companion object {
         private const val TAG = "MapManager"
@@ -24,6 +27,8 @@ class MapManager(
         private const val PATH_COLOR = Color.BLUE
         private const val PATH_WIDTH = 8f
         private const val LOOT_COLLECTION_RADIUS = 20f // meters
+        private val COLLECTION_RADIUS_COLOR = Color.argb(50, 0, 255, 0)
+        private val COLLECTION_RADIUS_STROKE_COLOR = Color.argb(100, 0, 255, 0)
     }
 
     fun setupMap() {
@@ -31,7 +36,7 @@ class MapManager(
         observeLocationUpdates()
         observeLocationStatus()
         observeLootBoxUpdates()
-        observeCollectedLootBoxes()
+        observeCollectionStatus()
     }
 
     private fun configureMap() {
@@ -52,7 +57,9 @@ class MapManager(
                 }
 
                 setOnCameraMoveStartedListener { reason ->
-                    Log.d(TAG, "Camera move started: $reason")
+                    if (reason == GoogleMap.OnCameraMoveStartedListener.REASON_GESTURE) {
+                        viewModel.shouldFollowUser.value = false
+                    }
                 }
             }
         } catch (e: SecurityException) {
@@ -61,17 +68,24 @@ class MapManager(
     }
 
     private fun observeLocationUpdates() {
-        viewModel.currentLocation.observe(viewModel.lifecycleOwner) { location ->
+        viewModel.currentLocation.observe(lifecycleOwner) { location ->
             location?.let {
-                updateUserLocation(LatLng(it.latitude, it.longitude))
-                checkNearbyLootBoxes(LatLng(it.latitude, it.longitude))
+                val latLng = LatLng(it.latitude, it.longitude)
+                updateUserLocation(latLng)
+                updateCollectionRadius(latLng)
+                checkNearbyLootBoxes(latLng)
+
+                // Auto-follow user if enabled
+                if (viewModel.shouldFollowUser.value == true) {
+                    centerOnUserLocation()
+                }
             }
         }
     }
 
     private fun observeLocationStatus() {
-        viewModel.locationPermissionGranted.observe(viewModel.lifecycleOwner) { granted ->
-            if (granted) {
+        viewModel.locationStatus.observe(lifecycleOwner) { isAvailable ->
+            if (isAvailable) {
                 enableLocationFeatures()
             } else {
                 disableLocationFeatures()
@@ -80,14 +94,17 @@ class MapManager(
     }
 
     private fun observeLootBoxUpdates() {
-        viewModel.nearbyLootBoxes.observe(viewModel.lifecycleOwner) { lootBoxes ->
+        viewModel.nearbyLootBoxes.observe(lifecycleOwner) { lootBoxes ->
             updateLootBoxMarkers(lootBoxes)
         }
     }
 
-    private fun observeCollectedLootBoxes() {
-        viewModel.collectedLootBoxes.observe(viewModel.lifecycleOwner) { collectedIds ->
-            removeCollectedLootBoxMarkers(collectedIds)
+    private fun observeCollectionStatus() {
+        viewModel.collectionStatus.observe(lifecycleOwner) { status ->
+            if (status.contains("collected")) {
+                // Show brief collection animation or notification
+                Log.d(TAG, "Collection status: $status")
+            }
         }
     }
 
@@ -98,7 +115,9 @@ class MapManager(
             MarkerOptions()
                 .position(location)
                 .title("Your Location")
+                .snippet("Distance: ${viewModel.getFormattedDistance()}")
                 .icon(BitmapDescriptorFactory.defaultMarker(BitmapDescriptorFactory.HUE_BLUE))
+                .anchor(0.5f, 0.5f)
         )
 
         // Add to path
@@ -111,6 +130,19 @@ class MapManager(
                 CameraUpdateFactory.newLatLngZoom(location, DEFAULT_ZOOM)
             )
         }
+    }
+
+    private fun updateCollectionRadius(location: LatLng) {
+        collectionRadiusCircle?.remove()
+
+        collectionRadiusCircle = googleMap.addCircle(
+            CircleOptions()
+                .center(location)
+                .radius(LOOT_COLLECTION_RADIUS.toDouble())
+                .fillColor(COLLECTION_RADIUS_COLOR)
+                .strokeColor(COLLECTION_RADIUS_STROKE_COLOR)
+                .strokeWidth(2f)
+        )
     }
 
     private fun updatePathPolyline() {
@@ -137,7 +169,7 @@ class MapManager(
 
         // Add or update markers for current loot boxes
         lootBoxes.forEach { lootBox ->
-            if (!lootBoxMarkers.containsKey(lootBox.id)) {
+            if (!lootBoxMarkers.containsKey(lootBox.id) && !lootBox.isCollected) {
                 addLootBoxMarker(lootBox)
             }
         }
@@ -146,17 +178,26 @@ class MapManager(
     private fun addLootBoxMarker(lootBox: LootBox) {
         val markerColor = when (lootBox.lootType) {
             LootType.COMMON -> BitmapDescriptorFactory.HUE_GREEN
+            LootType.UNCOMMON -> BitmapDescriptorFactory.HUE_CYAN
             LootType.RARE -> BitmapDescriptorFactory.HUE_ORANGE
             LootType.EPIC -> BitmapDescriptorFactory.HUE_VIOLET
             LootType.LEGENDARY -> BitmapDescriptorFactory.HUE_YELLOW
         }
 
+        val distanceToLoot = viewModel.currentLocation.value?.let { userLocation ->
+            LocationUtils.calculateDistance(
+                userLocation.latitude, userLocation.longitude,
+                lootBox.latitude, lootBox.longitude
+            )
+        } ?: 0f
+
         val marker = googleMap.addMarker(
             MarkerOptions()
                 .position(LatLng(lootBox.latitude, lootBox.longitude))
-                .title("${lootBox.lootType.name} Loot Box")
-                .snippet("Tap to collect!")
+                .title("${lootBox.lootType.displayName} Loot Box")
+                .snippet("${lootBox.contents.size} items • ${LocationUtils.formatDistance(distanceToLoot)} away")
                 .icon(BitmapDescriptorFactory.defaultMarker(markerColor))
+                .anchor(0.5f, 1.0f)
         )
 
         marker?.tag = lootBox.id
@@ -174,11 +215,13 @@ class MapManager(
         val currentLootBoxes = viewModel.nearbyLootBoxes.value ?: return
 
         currentLootBoxes.forEach { lootBox ->
-            val lootBoxLocation = LatLng(lootBox.latitude, lootBox.longitude)
-            val distance = calculateDistance(userLocation, lootBoxLocation)
+            if (!lootBox.isCollected) {
+                val lootBoxLocation = LatLng(lootBox.latitude, lootBox.longitude)
+                val distance = calculateDistance(userLocation, lootBoxLocation)
 
-            if (distance <= LOOT_COLLECTION_RADIUS) {
-                viewModel.collectLootBox(lootBox.id)
+                if (distance <= LOOT_COLLECTION_RADIUS) {
+                    viewModel.collectLootBox(lootBox.id)
+                }
             }
         }
     }
@@ -196,7 +239,21 @@ class MapManager(
     private fun handleMarkerClick(marker: Marker): Boolean {
         val lootBoxId = marker.tag as? String
         return if (lootBoxId != null) {
-            viewModel.collectLootBox(lootBoxId)
+            // Check if loot box is within collection range
+            val userLocation = viewModel.currentLocation.value
+            if (userLocation != null) {
+                val distance = calculateDistance(
+                    LatLng(userLocation.latitude, userLocation.longitude),
+                    marker.position
+                )
+
+                if (distance <= LOOT_COLLECTION_RADIUS) {
+                    viewModel.collectLootBox(lootBoxId)
+                } else {
+                    // Show info window with distance
+                    marker.showInfoWindow()
+                }
+            }
             true
         } else {
             false
@@ -205,7 +262,8 @@ class MapManager(
 
     private fun handleMapClick(latLng: LatLng) {
         Log.d(TAG, "Map clicked at: ${latLng.latitude}, ${latLng.longitude}")
-        // Add any map click handling logic here
+        // Re-enable user following when map is clicked
+        viewModel.shouldFollowUser.value = true
     }
 
     private fun enableLocationFeatures() {
@@ -234,6 +292,15 @@ class MapManager(
         }
     }
 
+    fun toggleUserFollowing() {
+        val currentFollowing = viewModel.shouldFollowUser.value ?: true
+        viewModel.shouldFollowUser.value = !currentFollowing
+
+        if (!currentFollowing) {
+            centerOnUserLocation()
+        }
+    }
+
     fun clearPath() {
         pathPolyline?.remove()
         pathPoints.clear()
@@ -251,15 +318,20 @@ class MapManager(
             val bounds = LatLngBounds.Builder()
             allMarkers.forEach { bounds.include(it) }
 
-            googleMap.animateCamera(
-                CameraUpdateFactory.newLatLngBounds(bounds.build(), 100)
-            )
+            try {
+                googleMap.animateCamera(
+                    CameraUpdateFactory.newLatLngBounds(bounds.build(), 100)
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Error showing all loot boxes", e)
+            }
         }
     }
 
     fun cleanup() {
         userLocationMarker?.remove()
         pathPolyline?.remove()
+        collectionRadiusCircle?.remove()
         lootBoxMarkers.values.forEach { it.remove() }
         lootBoxMarkers.clear()
         pathPoints.clear()
