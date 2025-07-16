@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "937804221595",
+    "project_id": "lootdropirl",
+    "storage_bucket": "lootdropirl.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:937804221595:android:513091b7586d7db5fa0a3e",
+        "android_client_info": {
+          "package_name": "com.end3r.lootdropirl"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDB5ONF3fbcMT8XJPJZWTdUm3VIHmSql-o"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
